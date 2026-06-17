@@ -3,7 +3,7 @@ import requests
 import re
 import urllib.parse
 
-app = FastAPI(title="PW DASH Proxy")
+app = FastAPI(title="PW HLS Proxy")
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -11,7 +11,7 @@ DEFAULT_HEADERS = {
     "Referer": "https://www.pw.live/"
 }
 
-PW_KEY_API = "https://api.pw.live/video/key"
+PW_KEY_API = "https://api.penpencil.co/v1/videos/get-hls-key"
 
 
 def fetch(url: str, token: str = None) -> requests.Response:
@@ -39,74 +39,70 @@ def make_absolute(base_url: str, path: str) -> str:
 def root():
     return {
         "status": "ok",
-        "message": "PW DASH Proxy is running",
-        "usage": "/pw?url={mpd_url}&parentId={parentId}&childId={childId}&videoId={videoId}&token={token}"
+        "message": "PW HLS Proxy is running",
+        "usage": "/pw?url={m3u8_or_mpd_url}&token={pw_bearer_token}"
     }
 
 
 @app.get("/pw")
-def get_mpd(
-    url: str,
-    token: str,
-    parentId: str,
-    childId: str,
-    videoId: str = None,
-    request: Request = None
-):
-    # Fetch MPD manifest directly (no token needed for CloudFront)
-    resp = fetch(url)
-    content = resp.text
-
+def get_playlist(url: str, token: str, request: Request):
     base_api_url = str(request.base_url)
     encoded_token = urllib.parse.quote(token, safe='')
 
-    # Build PW key API URL with parentId, childId, videoId
-    key_params = {"parentId": parentId, "childId": childId}
-    if videoId:
-        key_params["videoId"] = videoId
+    # Fetch the playlist (m3u8 or mpd)
+    resp = fetch(url, token)
+    content = resp.text
 
-    key_api_url = PW_KEY_API + "?" + urllib.parse.urlencode(key_params)
+    # Extract videoKey from URL (the UUID part)
+    # e.g. https://d1d34p8vz63oiq.cloudfront.net/61ce614c-893c-459d-855b-8d349727fc31/master.mpd
+    video_key_match = re.search(
+        r'cloudfront\.net/([a-f0-9\-]{36})/',
+        url
+    )
+    video_key = video_key_match.group(1) if video_key_match else None
+
+    # Build key API URL
+    if video_key:
+        key_api_url = f"{PW_KEY_API}?videoKey={video_key}"
+    else:
+        key_api_url = PW_KEY_API
+
     encoded_key_url = urllib.parse.quote(key_api_url, safe='')
     proxied_key_url = f"{base_api_url}key_proxy?url={encoded_key_url}&token={encoded_token}"
 
-    # Rewrite licenseUrl
+    # Rewrite AES-128 key URIs → /key_proxy
+    def replace_key_uri(match):
+        return f'URI="{proxied_key_url}"'
+
+    content = re.sub(r'URI="([^"]+)"', replace_key_uri, content)
+
+    # Make .ts segment URLs absolute
+    def replace_segment(match):
+        return make_absolute(url, match.group(0))
+
     content = re.sub(
-        r'licenseUrl="([^"]+)"',
-        lambda m: f'licenseUrl="{proxied_key_url}"',
-        content
+        r'^(?!#)(\S+\.ts\S*)$',
+        replace_segment,
+        content,
+        flags=re.MULTILINE
     )
 
-    # Rewrite dashif:laurl
-    content = re.sub(
-        r'(<dashif:laurl[^>]*>)[^<]*(</dashif:laurl>)',
-        lambda m: f'{m.group(1)}{proxied_key_url}{m.group(2)}',
-        content
-    )
+    # Make nested .m3u8 URLs absolute (master playlist → variant)
+    def replace_m3u8(match):
+        nested = make_absolute(url, match.group(0))
+        encoded_nested = urllib.parse.quote(nested, safe='')
+        return f"{base_api_url}pw?url={encoded_nested}&token={encoded_token}"
 
-    # Make initialization segments absolute
     content = re.sub(
-        r'initialization="([^"]+)"',
-        lambda m: f'initialization="{make_absolute(url, m.group(1))}"',
-        content
-    )
-
-    # Make media segment templates absolute
-    content = re.sub(
-        r'\bmedia="([^"$][^"]*)"',
-        lambda m: f'media="{make_absolute(url, m.group(1))}"',
-        content
-    )
-
-    # Make BaseURL absolute
-    content = re.sub(
-        r'<BaseURL>([^<]+)</BaseURL>',
-        lambda m: f'<BaseURL>{make_absolute(url, m.group(1).strip())}</BaseURL>',
-        content
+        r'^(?!#)(\S+\.m3u8\S*)$',
+        replace_m3u8,
+        content,
+        flags=re.MULTILINE
     )
 
     return Response(
         content=content,
-        media_type="application/dash+xml",
+        media_type="application/vnd.apple.mpegurl",
         headers={"Access-Control-Allow-Origin": "*"}
     )
 
@@ -114,12 +110,17 @@ def get_mpd(
 @app.get("/key_proxy")
 def proxy_key(url: str, token: str):
     resp = fetch(url, token)
+
+    # PW key API returns JSON with key
     try:
         data = resp.json()
+        # Try different response shapes
         key_hex = (
             data.get("key") or
-            data.get("data", {}).get("key", "") or
-            data.get("keys", [{}])[0].get("k", "")
+            data.get("data", {}).get("key") or
+            data.get("encKey") or
+            data.get("data", {}).get("encKey") or
+            ""
         )
         if key_hex:
             key_bytes = bytes.fromhex(key_hex.replace("-", ""))
@@ -130,6 +131,8 @@ def proxy_key(url: str, token: str):
             )
     except Exception:
         pass
+
+    # Fallback: return raw response
     return Response(
         content=resp.content,
         media_type="application/octet-stream",
