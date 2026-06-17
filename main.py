@@ -6,8 +6,7 @@ import urllib.parse
 app = FastAPI(title="PW DASH Proxy")
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Origin": "https://www.pw.live",
     "Referer": "https://www.pw.live/"
 }
@@ -37,14 +36,6 @@ def make_absolute(base_url: str, path: str) -> str:
 
 
 def parse_mpd_url(full_url: str):
-    """
-    PW URL format:
-    https://cdn.../master.mpd&parentId=XXX&childId=YYY&videoId=ZZZ
-    
-    Split into:
-    - clean_mpd_url: https://cdn.../master.mpd
-    - params: {parentId, childId, videoId}
-    """
     if ".mpd&" in full_url:
         parts = full_url.split(".mpd&", 1)
         clean_url = parts[0] + ".mpd"
@@ -56,7 +47,6 @@ def parse_mpd_url(full_url: str):
     else:
         clean_url = full_url
         params = {}
-
     return clean_url, params
 
 
@@ -71,22 +61,17 @@ def root():
 
 @app.get("/pw")
 def get_mpd(url: str, token: str, request: Request):
-
-    # Parse clean MPD URL and extract parentId, childId, videoId
     clean_url, params = parse_mpd_url(url)
-
     parent_id = params.get("parentId")
-    child_id  = params.get("childId")
-    video_id  = params.get("videoId")
+    child_id = params.get("childId")
+    video_id = params.get("videoId")
 
-    # Fetch MPD manifest
     resp = fetch(clean_url, token)
     content = resp.text
 
     base_api_url = str(request.base_url)
     encoded_token = urllib.parse.quote(token, safe='')
 
-    # Build PW key API URL
     key_params = {}
     if parent_id:
         key_params["parentId"] = parent_id
@@ -99,35 +84,30 @@ def get_mpd(url: str, token: str, request: Request):
     encoded_key_url = urllib.parse.quote(key_api_url, safe='')
     proxied_key_url = f"{base_api_url}key_proxy?url={encoded_key_url}&token={encoded_token}"
 
-    # Rewrite licenseUrl → /key_proxy
     content = re.sub(
         r'licenseUrl="([^"]+)"',
         lambda m: f'licenseUrl="{proxied_key_url}"',
         content
     )
 
-    # Rewrite dashif:laurl tag
     content = re.sub(
         r'(<dashif:laurl[^>]*>)[^<]*(</dashif:laurl>)',
         lambda m: f'{m.group(1)}{proxied_key_url}{m.group(2)}',
         content
     )
 
-    # Make initialization segments absolute
     content = re.sub(
         r'initialization="([^"]+)"',
         lambda m: f'initialization="{make_absolute(clean_url, m.group(1))}"',
         content
     )
 
-    # Make media segment templates absolute
     content = re.sub(
         r'\bmedia="([^"$][^"]*)"',
         lambda m: f'media="{make_absolute(clean_url, m.group(1))}"',
         content
     )
 
-    # Make BaseURL absolute
     content = re.sub(
         r'<BaseURL>([^<]+)</BaseURL>',
         lambda m: f'<BaseURL>{make_absolute(clean_url, m.group(1).strip())}</BaseURL>',
@@ -144,7 +124,6 @@ def get_mpd(url: str, token: str, request: Request):
 @app.get("/key_proxy")
 def proxy_key(url: str, token: str):
     resp = fetch(url, token)
-
     try:
         data = resp.json()
         key_hex = (
@@ -161,19 +140,6 @@ def proxy_key(url: str, token: str):
             )
     except Exception:
         pass
-
-    return Response(
-        content=resp.content,
-        media_type="application/octet-stream",
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
-                content=key_bytes,
-                media_type="application/octet-stream",
-                headers={"Access-Control-Allow-Origin": "*"}
-            )
-    except Exception:
-        pass
-
     return Response(
         content=resp.content,
         media_type="application/octet-stream",
