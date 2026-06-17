@@ -36,13 +36,28 @@ def make_absolute(base_url: str, path: str) -> str:
     return urllib.parse.urljoin(base, path)
 
 
-def get_clean_mpd_url(url: str) -> str:
-    """Return just the MPD URL without extra query params."""
-    if ".mpd&" in url:
-        return url.split(".mpd&")[0] + ".mpd"
-    if ".mpd?" in url:
-        return url.split(".mpd?")[0] + ".mpd"
-    return url
+def parse_mpd_url(full_url: str):
+    """
+    PW URL format:
+    https://cdn.../master.mpd&parentId=XXX&childId=YYY&videoId=ZZZ
+    
+    Split into:
+    - clean_mpd_url: https://cdn.../master.mpd
+    - params: {parentId, childId, videoId}
+    """
+    if ".mpd&" in full_url:
+        parts = full_url.split(".mpd&", 1)
+        clean_url = parts[0] + ".mpd"
+        params = dict(urllib.parse.parse_qsl(parts[1]))
+    elif ".mpd?" in full_url:
+        parts = full_url.split(".mpd?", 1)
+        clean_url = parts[0] + ".mpd"
+        params = dict(urllib.parse.parse_qsl(parts[1]))
+    else:
+        clean_url = full_url
+        params = {}
+
+    return clean_url, params
 
 
 @app.get("/")
@@ -50,71 +65,69 @@ def root():
     return {
         "status": "ok",
         "message": "PW DASH Proxy is running",
-        "usage": "/pw?url={mpd_url}&parentId={parentId}&childId={childId}&videoId={videoId}&token={pw_bearer_token}"
+        "usage": "/pw?url={mpd_url}&token={pw_bearer_token}"
     }
 
 
 @app.get("/pw")
-def get_mpd(
-    url: str,
-    token: str,
-    parentId: str = None,
-    childId: str = None,
-    videoId: str = None,
-    request: Request = None
-):
-    # Step 1: Clean MPD URL
-    clean_url = get_clean_mpd_url(url)
+def get_mpd(url: str, token: str, request: Request):
 
-    # Step 2: Fetch MPD with token
+    # Parse clean MPD URL and extract parentId, childId, videoId
+    clean_url, params = parse_mpd_url(url)
+
+    parent_id = params.get("parentId")
+    child_id  = params.get("childId")
+    video_id  = params.get("videoId")
+
+    # Fetch MPD manifest
     resp = fetch(clean_url, token)
     content = resp.text
 
     base_api_url = str(request.base_url)
     encoded_token = urllib.parse.quote(token, safe='')
 
-    # Step 3: Build PW key API URL
+    # Build PW key API URL
     key_params = {}
-    if parentId:
-        key_params["parentId"] = parentId
-    if childId:
-        key_params["childId"] = childId
-    if videoId:
-        key_params["videoId"] = videoId
+    if parent_id:
+        key_params["parentId"] = parent_id
+    if child_id:
+        key_params["childId"] = child_id
+    if video_id:
+        key_params["videoId"] = video_id
 
     key_api_url = PW_KEY_API + "?" + urllib.parse.urlencode(key_params)
     encoded_key_url = urllib.parse.quote(key_api_url, safe='')
     proxied_key_url = f"{base_api_url}key_proxy?url={encoded_key_url}&token={encoded_token}"
 
-    # Step 4: Rewrite licenseUrl → our /key_proxy
+    # Rewrite licenseUrl → /key_proxy
     content = re.sub(
         r'licenseUrl="([^"]+)"',
         lambda m: f'licenseUrl="{proxied_key_url}"',
         content
     )
 
-    # Step 5: Rewrite dashif:laurl tag
+    # Rewrite dashif:laurl tag
     content = re.sub(
         r'(<dashif:laurl[^>]*>)[^<]*(</dashif:laurl>)',
         lambda m: f'{m.group(1)}{proxied_key_url}{m.group(2)}',
         content
     )
 
-    # Step 6: Make initialization segment URLs absolute
+    # Make initialization segments absolute
     content = re.sub(
         r'initialization="([^"]+)"',
         lambda m: f'initialization="{make_absolute(clean_url, m.group(1))}"',
         content
     )
 
-    # Step 7: Make media segment template URLs absolute
+    # Make media segment templates absolute
     content = re.sub(
         r'\bmedia="([^"$][^"]*)"',
         lambda m: f'media="{make_absolute(clean_url, m.group(1))}"',
         content
     )
 
-    # Step 8: Make BaseURL absolute
+    # Make BaseURL absolute
     content = re.sub(
         r'<BaseURL>([^<]+)</BaseURL>',
         lambda m: f'<BaseURL>{make_absolute(clean_url, m.group(1).strip())}</BaseURL>',
@@ -130,7 +143,6 @@ def get_mpd(
 
 @app.get("/key_proxy")
 def proxy_key(url: str, token: str):
-    """Fetch ClearKey from PW key API and return raw bytes."""
     resp = fetch(url, token)
 
     try:
@@ -143,6 +155,18 @@ def proxy_key(url: str, token: str):
         if key_hex:
             key_bytes = bytes.fromhex(key_hex.replace("-", ""))
             return Response(
+                content=key_bytes,
+                media_type="application/octet-stream",
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+    except Exception:
+        pass
+
+    return Response(
+        content=resp.content,
+        media_type="application/octet-stream",
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
                 content=key_bytes,
                 media_type="application/octet-stream",
                 headers={"Access-Control-Allow-Origin": "*"}
