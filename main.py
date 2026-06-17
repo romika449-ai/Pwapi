@@ -12,6 +12,7 @@ DEFAULT_HEADERS = {
 }
 
 PW_KEY_API = "https://api.penpencil.co/v1/videos/get-hls-key"
+PW_VIDEO_API = "https://api.penpencil.co/v1/videos"
 
 
 def fetch(url: str, token: str = None) -> requests.Response:
@@ -35,63 +36,118 @@ def make_absolute(base_url: str, path: str) -> str:
     return urllib.parse.urljoin(base, path)
 
 
+def get_video_url(token: str, parent_id: str, child_id: str, video_id: str) -> str:
+    """
+    Fetch fresh signed MPD/m3u8 URL from PW API using parentId, childId, videoId
+    """
+    # Try penpencil API to get fresh stream URL
+    api_url = f"{PW_VIDEO_API}/{video_id}?batchId={child_id}&parentBatchId={parent_id}"
+    headers = DEFAULT_HEADERS.copy()
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        # Try to get video URL from response
+        video_data = data.get("data", {})
+        url = (
+            video_data.get("videoUrl") or
+            video_data.get("url") or
+            video_data.get("hlsUrl") or
+            video_data.get("dashUrl") or
+            ""
+        )
+        return url
+    except Exception:
+        return ""
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "PW HLS Proxy is running",
-        "usage": "/pw?url={m3u8_or_mpd_url}&token={pw_bearer_token}"
+        "usage": "/pw?url={mpd_url}&token={pw_bearer_token}&parentId={parentId}&childId={childId}&videoId={videoId}"
     }
 
 
 @app.get("/pw")
-def get_playlist(url: str, token: str, request: Request):
+def get_playlist(
+    url: str,
+    token: str,
+    parentId: str = None,
+    childId: str = None,
+    videoId: str = None,
+    request: Request = None
+):
     base_api_url = str(request.base_url)
     encoded_token = urllib.parse.quote(token, safe='')
 
-    # Fetch the playlist (m3u8 or mpd)
-    resp = fetch(url, token)
-    content = resp.text
+    # Try to fetch the URL directly first
+    # If 403, try with token
+    # If still 403, try getting fresh URL from PW API
+    mpd_content = None
+    final_url = url
 
-    # Extract videoKey from URL (the UUID part)
-    # e.g. https://d1d34p8vz63oiq.cloudfront.net/61ce614c-893c-459d-855b-8d349727fc31/master.mpd
-    video_key_match = re.search(
-        r'cloudfront\.net/([a-f0-9\-]{36})/',
-        url
-    )
-    video_key = video_key_match.group(1) if video_key_match else None
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS.copy(), timeout=15)
+        if resp.status_code == 403 and token:
+            headers = DEFAULT_HEADERS.copy()
+            headers["Authorization"] = f"Bearer {token}"
+            resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 403 and all([parentId, childId, videoId]):
+            # Get fresh URL from PW API
+            fresh_url = get_video_url(token, parentId, childId, videoId)
+            if fresh_url:
+                final_url = fresh_url
+                resp = requests.get(fresh_url, headers=DEFAULT_HEADERS.copy(), timeout=15)
+        resp.raise_for_status()
+        mpd_content = resp.text
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    # Build key API URL
-    if video_key:
-        key_api_url = f"{PW_KEY_API}?videoKey={video_key}"
+    content = mpd_content
+
+    # Build key proxy URL
+    if videoId:
+        key_api_url = f"{PW_KEY_API}?videoKey={videoId}"
+    elif parentId and childId:
+        key_api_url = f"{PW_KEY_API}?parentId={parentId}&childId={childId}"
     else:
         key_api_url = PW_KEY_API
 
     encoded_key_url = urllib.parse.quote(key_api_url, safe='')
     proxied_key_url = f"{base_api_url}key_proxy?url={encoded_key_url}&token={encoded_token}"
 
-    # Rewrite AES-128 key URIs → /key_proxy
-    def replace_key_uri(match):
-        return f'URI="{proxied_key_url}"'
+    # Rewrite AES-128 key URIs
+    content = re.sub(
+        r'URI="([^"]+)"',
+        lambda m: f'URI="{proxied_key_url}"',
+        content
+    )
 
-    content = re.sub(r'URI="([^"]+)"', replace_key_uri, content)
-
-    # Make .ts segment URLs absolute
-    def replace_segment(match):
-        return make_absolute(url, match.group(0))
-
+    # Make .ts segments absolute
     content = re.sub(
         r'^(?!#)(\S+\.ts\S*)$',
-        replace_segment,
+        lambda m: make_absolute(final_url, m.group(0)),
         content,
         flags=re.MULTILINE
     )
 
-    # Make nested .m3u8 URLs absolute (master playlist → variant)
+    # Rewrite nested .m3u8 through proxy
     def replace_m3u8(match):
-        nested = make_absolute(url, match.group(0))
+        nested = make_absolute(final_url, match.group(0))
         encoded_nested = urllib.parse.quote(nested, safe='')
-        return f"{base_api_url}pw?url={encoded_nested}&token={encoded_token}"
+        params = f"url={encoded_nested}&token={encoded_token}"
+        if parentId:
+            params += f"&parentId={urllib.parse.quote(parentId, safe='')}"
+        if childId:
+            params += f"&childId={urllib.parse.quote(childId, safe='')}"
+        if videoId:
+            params += f"&videoId={urllib.parse.quote(videoId, safe='')}"
+        return f"{base_api_url}pw?{params}"
 
     content = re.sub(
         r'^(?!#)(\S+\.m3u8\S*)$',
@@ -110,11 +166,8 @@ def get_playlist(url: str, token: str, request: Request):
 @app.get("/key_proxy")
 def proxy_key(url: str, token: str):
     resp = fetch(url, token)
-
-    # PW key API returns JSON with key
     try:
         data = resp.json()
-        # Try different response shapes
         key_hex = (
             data.get("key") or
             data.get("data", {}).get("key") or
@@ -131,8 +184,6 @@ def proxy_key(url: str, token: str):
             )
     except Exception:
         pass
-
-    # Fallback: return raw response
     return Response(
         content=resp.content,
         media_type="application/octet-stream",
